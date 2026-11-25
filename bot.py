@@ -26,7 +26,7 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
-logger = logging.getLogger("FastBot")
+logger = logging.getLogger("MohitBot")
 
 # ================= CONFIG =================
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "9079313944:AAFXcg-quWi7ABouEQX8724Hiscr_wHLR9U")
@@ -89,13 +89,13 @@ def get_all_user_ids():
     return [r["user_id"] for r in rows]
 
 
-# ================= WEB SERVER & KEEP-ALIVE =================
+# ================= WEB SERVER & IN-CODE PING =================
 web_app = Flask(__name__)
 
 
 @web_app.get("/")
 def home():
-    return "OK", 200
+    return "Bot is alive!", 200
 
 
 @web_app.get("/health")
@@ -107,21 +107,27 @@ def start_web_server():
     web_app.run(host="0.0.0.0", port=PORT, use_reloader=False)
 
 
-def keep_alive_loop():
-    time.sleep(25)
-    if not RENDER_EXTERNAL_URL:
-        logger.warning("RENDER_EXTERNAL_URL set nahi hai.")
-        return
+def get_ping_targets():
+    targets = []
+    if RENDER_EXTERNAL_URL:
+        targets.append(f"{RENDER_EXTERNAL_URL.rstrip('/')}/health")
+    targets.append(f"http://127.0.0.1:{PORT}/health")
+    return targets
 
-    health_url = f"{RENDER_EXTERNAL_URL.rstrip('/')}/health"
-    logger.info("Keep-alive loop active: %s", health_url)
+
+def code_ping_loop():
+    time.sleep(20)
+    targets = get_ping_targets()
+    logger.info("Code ping loop started. Targets: %s", targets)
 
     while True:
-        try:
-            requests.get(health_url, timeout=10)
-        except Exception as exc:
-            logger.warning("Ping error: %s", exc)
-        time.sleep(480)  # Har 8 minute mein ping
+        for url in targets:
+            try:
+                res = requests.get(url, timeout=10)
+                logger.info("Ping %s -> %s", url, res.status_code)
+            except Exception as exc:
+                logger.warning("Ping failed for %s: %s", url, exc)
+        time.sleep(300)  # Har 5 minute mein ping
 
 
 # ================= KEYBOARDS =================
@@ -353,9 +359,9 @@ async def stats_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
         return
     total = len(get_all_user_ids())
-    ping_ok = "Set ✅" if RENDER_EXTERNAL_URL else "Missing ⚠️"
+    ping_ok = "Set ✅" if RENDER_EXTERNAL_URL else "Local Only ⚠️"
     await update.message.reply_text(
-        f"📊 **Stats**\nUsers: `{total}`\nSelf-Ping URL: `{ping_ok}`"
+        f"📊 **Stats**\nUsers: `{total}`\nPing Mode: `{ping_ok}`"
     )
 
 
@@ -437,7 +443,7 @@ async def error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE):
 def main():
     init_db()
     threading.Thread(target=start_web_server, daemon=True).start()
-    threading.Thread(target=keep_alive_loop, daemon=True).start()
+    threading.Thread(target=code_ping_loop, daemon=True).start()
 
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start_cmd))
@@ -457,4 +463,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
+            
