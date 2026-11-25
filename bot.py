@@ -3,7 +3,12 @@ import os
 import sqlite3
 import threading
 from flask import Flask
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+    Update,
+)
 from telegram.error import Forbidden, TelegramError
 from telegram.ext import (
     Application,
@@ -22,11 +27,13 @@ FORCE_CHANNELS = [
     {"id": -1004474453856, "name": "📢 JOIN CHANNEL 2", "url": "https://t.me/+UyBmDcQRKORlNGI1"},
 ]
 
+# ₹140 free⚡😘 button ke liye channel link (zaroorat ho toh apna link yahan badal le)
+FREE_140_CHANNEL_URL = os.environ.get("FREE_140_CHANNEL_URL", "https://t.me/+ILptMG11g3c0ZDg1")
+
 ADMIN_IDS = {8429424734, 8472943262}
 DB_PATH = "bot_data.db"
 PORT = int(os.environ.get("PORT", "8080"))
 
-# Admin broadcast waiting state: admin_id -> True
 awaiting_broadcast = set()
 
 
@@ -88,7 +95,17 @@ def start_web_server():
     web_app.run(host="0.0.0.0", port=PORT, use_reloader=False)
 
 
-# ================= FORCE-JOIN & MENUS =================
+# ================= KEYBOARDS & MENUS =================
+def main_reply_keyboard():
+    return ReplyKeyboardMarkup(
+        [
+            ["Get otp panel", "help"],
+            ["₹140 free⚡😘"],
+        ],
+        resize_keyboard=True,
+    )
+
+
 def join_keyboard():
     return InlineKeyboardMarkup(
         [
@@ -115,6 +132,12 @@ def claim_keyboard():
 def contact_keyboard():
     return InlineKeyboardMarkup(
         [[{"text": "📩 Message Admin Now", "url": "https://t.me/FZXMOHIT1"}]]
+    )
+
+
+def free_140_keyboard():
+    return InlineKeyboardMarkup(
+        [[{"text": "📢 Join Channel", "url": FREE_140_CHANNEL_URL}]]
     )
 
 
@@ -155,6 +178,10 @@ async def send_claim_menu(target_message):
         parse_mode="Markdown",
         reply_markup=claim_keyboard(),
     )
+    await target_message.reply_text(
+        "👇 Niche se option chunein:",
+        reply_markup=main_reply_keyboard(),
+    )
 
 
 async def send_contact_menu(target_message):
@@ -164,6 +191,13 @@ async def send_contact_menu(target_message):
         "👤 **Official Admin:** @FZXMOHIT1",
         parse_mode="Markdown",
         reply_markup=contact_keyboard(),
+    )
+
+
+async def send_free_140_loot(target_message):
+    await target_message.reply_text(
+        f"140₹ free Bug loot here\n{FREE_140_CHANNEL_URL}",
+        reply_markup=free_140_keyboard(),
     )
 
 
@@ -209,7 +243,7 @@ async def broadcast_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     total_users = len(get_all_user_ids())
     await update.message.reply_text(
         f"📣 **Broadcast Mode ON** (Total Users: `{total_users}`)\n\n"
-        "Ab jo bhi bhejoge—**Text, Photo, Video, ya Document/File** (caption ke saath ya bina caption)—"
+        "Ab jo bhi bhejoge—**Text, Photo, Video, ya Document/File**—"
         "woh sab users ko broadcast ho jayega.\n\n"
         "Cancel karne ke liye `/cancel` bhejo.",
         parse_mode="Markdown",
@@ -255,7 +289,7 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await send_contact_menu(query.message)
 
 
-# ================= BROADCAST & USER TRACKING =================
+# ================= REPLY BUTTONS, BROADCAST & USER TRACKING =================
 async def handle_messages(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     if not msg:
@@ -263,7 +297,7 @@ async def handle_messages(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     save_user(user)
 
-    # Agar admin broadcast mode mein hai
+    # 1. Agar admin broadcast mode mein hai
     if user.id in ADMIN_IDS and user.id in awaiting_broadcast:
         awaiting_broadcast.remove(user.id)
         user_ids = get_all_user_ids()
@@ -280,10 +314,8 @@ async def handle_messages(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     message_id=msg.message_id,
                 )
                 sent += 1
-                await asyncio.sleep(0.05)  # Flood control ke liye chhota safe delay
-            except Forbidden:
-                failed += 1
-            except TelegramError:
+                await asyncio.sleep(0.05)
+            except (Forbidden, TelegramError):
                 failed += 1
 
         await status_msg.edit_text(
@@ -292,13 +324,25 @@ async def handle_messages(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"⚠️ Failed/Blocked: `{failed}`",
             parse_mode="Markdown",
         )
+        return
+
+    # 2. Reply keyboard buttons handle karna
+    txt = (msg.text or "").strip()
+    if txt == "Get otp panel":
+        joined = await check_force_join(ctx.bot, user.id)
+        if not joined:
+            await send_join_prompt(msg)
+            return
+        await send_claim_menu(msg)
+    elif txt.lower() == "help":
+        await send_contact_menu(msg)
+    elif txt == "₹140 free⚡😘":
+        await send_free_140_loot(msg)
 
 
 # ================= MAIN =================
 def main():
     init_db()
-
-    # Render keep-alive web server background thread mein
     threading.Thread(target=start_web_server, daemon=True).start()
 
     app = Application.builder().token(BOT_TOKEN).build()
@@ -312,9 +356,10 @@ def main():
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_messages))
 
-    print("Bot + Keep-alive server chal raha hai...")
+    print("Bot chal raha hai...")
     app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
     main()
+        
