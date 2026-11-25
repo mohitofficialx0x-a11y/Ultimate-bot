@@ -1,10 +1,11 @@
 import asyncio
+import logging
 import os
 import sqlite3
 import threading
 import time
-import requests
 from flask import Flask
+import requests
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -21,12 +22,16 @@ from telegram.ext import (
     filters,
 )
 
+# ================= LOGGING =================
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger("MohitBot")
+
 # ================= CONFIG =================
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "9079313944:AAFXcg-quWi7ABouEQX8724Hiscr_wHLR9U")
-
-# APNA RENDER WEB SERVICE URL YAHAN DAALEIN (e.g., https://your-app.onrender.com)
-# Is URL par har 12 minute mein automatic pin jayega taaki sleep na ho.
-RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", "") 
+RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "").strip()
 
 FORCE_CHANNELS = [
     {"id": -1004383355739, "name": "📢 JOIN CHANNEL 1", "url": "https://t.me/+ILptMG11g3c0ZDg1"},
@@ -34,12 +39,15 @@ FORCE_CHANNELS = [
 ]
 
 FREE_140_CHANNEL_URL = os.environ.get("FREE_140_CHANNEL_URL", "https://t.me/+ILptMG11g3c0ZDg1")
-
 ADMIN_IDS = {8429424734, 8472943262}
 DB_PATH = "bot_data.db"
 PORT = int(os.environ.get("PORT", "8080"))
 
+# Active states & last bot message tracking for /cancel + back
 awaiting_broadcast = set()
+maintenance_mode = False
+last_bot_messages = {}  # user_id -> {"chat_id": int, "message_id": int}
+
 
 # ================= DATABASE =================
 def get_db():
@@ -62,6 +70,8 @@ def init_db():
 
 
 def save_user(user):
+    if not user:
+        return
     with get_db() as con:
         con.execute(
             """
@@ -81,13 +91,13 @@ def get_all_user_ids():
     return [r["user_id"] for r in rows]
 
 
-# ================= RENDER KEEP-ALIVE WEB SERVER =================
+# ================= WEB SERVER & ANTI-SLEEP PINGER =================
 web_app = Flask(__name__)
 
 
 @web_app.get("/")
 def home():
-    return "Bot is alive and running!", 200
+    return "Bot is alive!", 200
 
 
 @web_app.get("/health")
@@ -99,37 +109,26 @@ def start_web_server():
     web_app.run(host="0.0.0.0", port=PORT, use_reloader=False)
 
 
-# ================= ANTI-SLEEP SELF PINGER ⚡ =================
-def keep_alive_ping_loop():
-    """Ye loop background mein har 12 minute mein Render URL ko request bhejta hai taaki server online rahe."""
-    # Deploy hone ke baad 60s wait karega start hone ke liye
-    time.sleep(60) 
-    url_to_ping = RENDER_URL.strip()
-    
-    if not url_to_ping:
-        print("⚠️ Warn: RENDER_EXTERNAL_URL configure nahi hai! Self-ping chalu nahi ho paya.")
+def keep_alive_loop():
+    time.sleep(30)
+    if not RENDER_EXTERNAL_URL:
+        logger.warning("RENDER_EXTERNAL_URL set nahi hai; self-ping skip ho raha hai.")
         return
-        
-    if not url_to_ping.endswith("/health"):
-        url_to_ping = url_to_ping.rstrip("/") + "/health"
 
-    print(f"🚀 Anti-Sleep loop start ho chuka hai! Target URL: {url_to_ping}")
+    base_url = RENDER_EXTERNAL_URL.rstrip("/")
+    health_url = f"{base_url}/health"
+    logger.info("Anti-sleep self-ping loop start: %s", health_url)
+
     while True:
         try:
-            # Server ko jagaye rakhne ke liye self GET request
-            response = requests.get(url_to_ping, timeout=15)
-            if response.status_code == 200:
-                print(f"⚡ Ping Successful! Bot is Awake ({response.status_code})")
-            else:
-                print(f"⚠️ Ping status suspicious: {response.status_code}")
-        except Exception as e:
-            print(f"❌ Ping request failed: {e}. (Re-trying in next 12m)")
-        
-        # Har 12 minute (720 seconds) mein ping bhejega (Render sleep time is 15 mins)
-        time.sleep(720)
+            res = requests.get(health_url, timeout=15)
+            logger.info("Self-ping status: %s", res.status_code)
+        except Exception as exc:
+            logger.warning("Self-ping failed: %s", exc)
+        time.sleep(600)  # Har 10 minute mein ping
 
 
-# ================= KEYBOARDS & MENUS =================
+# ================= KEYBOARDS =================
 def main_reply_keyboard():
     return ReplyKeyboardMarkup(
         [
@@ -175,6 +174,27 @@ def free_140_keyboard():
     )
 
 
+# ================= HELPERS & /CANCEL + BACK =================
+async def send_tracked_message(target_message, user_id: int, text: str, **kwargs):
+    sent = await target_message.reply_text(text, **kwargs)
+    if sent:
+        last_bot_messages[user_id] = {
+            "chat_id": sent.chat_id,
+            "message_id": sent.message_id,
+        }
+    return sent
+
+
+async def delete_last_bot_message(bot, user_id: int):
+    info = last_bot_messages.pop(user_id, None)
+    if not info:
+        return
+    try:
+        await bot.delete_message(chat_id=info["chat_id"], message_id=info["message_id"])
+    except TelegramError:
+        pass
+
+
 async def check_force_join(bot, user_id: int) -> bool:
     allowed_statuses = {"member", "administrator", "creator"}
     for ch in FORCE_CHANNELS:
@@ -187,18 +207,39 @@ async def check_force_join(bot, user_id: int) -> bool:
     return True
 
 
-async def send_join_prompt(target_message):
-    await target_message.reply_text(
+async def is_blocked_by_maintenance(update: Update) -> bool:
+    user = update.effective_user
+    if maintenance_mode and (not user or user.id not in ADMIN_IDS):
+        if update.message:
+            await update.message.reply_text(
+                "🔧 **Maintenance Mode ON**\n\n"
+                "Abhi bot ya panels par update chal raha hai. Thodi der baad try karein!"
+            )
+        elif update.callback_query:
+            await update.callback_query.answer(
+                "🔧 Abhi maintenance chal raha hai, thodi der baad try karein!",
+                show_alert=True,
+            )
+        return True
+    return False
+
+
+async def send_join_prompt(target_message, user_id: int):
+    await send_tracked_message(
+        target_message,
+        user_id,
         "🔥 **WELCOME TO otp panels BOT** 🔥\n\n"
         "📢 Is bot ko use karne ke liye aapko hamare channels join karna zaroori hai!\n\n"
-        "👇 Niche diye gaye buttons par click karke channels join karein:",
-        parse_mode="Markdown",
+        "👇 Niche diye gaye buttons par click karke channels join karein:\n"
+        "_(Pichhla step cancel karke back aane ke liye `/cancel` bhejein)_",
         reply_markup=join_keyboard(),
     )
 
 
-async def send_claim_menu(target_message):
-    await target_message.reply_text(
+async def send_claim_menu(target_message, user_id: int):
+    await send_tracked_message(
+        target_message,
+        user_id,
         "👑 WELCOME TO MOHIT FZX 👑\n\n"
         "🔥 नमस्कार! आपका हमारे Telegram Account पर स्वागत है। ❤️\n\n"
         "🚀 यहाँ आपको मिलेंगे हमारे सभी जरूरी OTP Panel और Bot Links एक ही जगह पर।\n\n"
@@ -206,65 +247,99 @@ async def send_claim_menu(target_message):
         "📲 नीचे दिए गए बटन पर क्लिक करें:\n"
         "━━━━━━━━━━━━━━━━━━\n\n"
         "👤 **Admin / Contact:** @FZXMOHIT1\n"
-        "💬 Need help? Type /contact\n\n"
+        "💬 Need help? Type /contact | Back/Cancel: /cancel\n\n"
         "⚡ Fast Service | 24×7 Support\n"
         "💀 POWERED BY MOHIT™ 🚀",
-        parse_mode="Markdown",
         reply_markup=claim_keyboard(),
     )
     await target_message.reply_text(
-        "👇 Niche se option chunein:",
+        "👇 Niche se option chunein (Cancel/Back ke liye `/cancel`):",
         reply_markup=main_reply_keyboard(),
     )
 
 
-async def send_contact_menu(target_message):
-    await target_message.reply_text(
+async def send_contact_menu(target_message, user_id: int):
+    await send_tracked_message(
+        target_message,
+        user_id,
         "👋 Hello Bhai! Are you trying to contact me? 🤔💬\n\n"
         "Agar koi dikkat ya query hai, toh seedha niche diye gaye button par click karke mujhe message karo! 🚀🔥\n\n"
-        "👤 **Official Admin:** @FZXMOHIT1",
-        parse_mode="Markdown",
+        "👤 **Official Admin:** @FZXMOHIT1\n"
+        "↩️ Pichhla step cancel karke back aane ke liye `/cancel` bhejein.",
         reply_markup=contact_keyboard(),
     )
 
 
-async def send_free_140_loot(target_message):
-    await target_message.reply_text(
-        f"140₹ free Bug loot here\n{FREE_140_CHANNEL_URL}",
+async def send_free_140_loot(target_message, user_id: int):
+    await send_tracked_message(
+        target_message,
+        user_id,
+        f"140₹ free Bug loot here\n{FREE_140_CHANNEL_URL}\n\n"
+        "↩️ Back/Cancel ke liye `/cancel` bhejein.",
         reply_markup=free_140_keyboard(),
     )
 
 
 # ================= COMMANDS =================
 async def start_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if await is_blocked_by_maintenance(update):
+        return
     user = update.effective_user
     save_user(user)
 
-    joined = await check_force_join(ctx.bot, user.id)
-    if joined:
-        await send_claim_menu(update.message)
+    if await check_force_join(ctx.bot, user.id):
+        await send_claim_menu(update.message, user.id)
     else:
-        await send_join_prompt(update.message)
+        await send_join_prompt(update.message, user.id)
 
 
 async def claim_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if await is_blocked_by_maintenance(update):
+        return
     user = update.effective_user
     save_user(user)
 
-    joined = await check_force_join(ctx.bot, user.id)
-    if not joined:
-        await update.message.reply_text(
+    if not await check_force_join(ctx.bot, user.id):
+        await send_tracked_message(
+            update.message,
+            user.id,
             "⚠️ Pehle **dono channels** join karo, phir **✅ I HAVE JOINED** dabao!",
-            parse_mode="Markdown",
             reply_markup=join_keyboard(),
         )
         return
-    await send_claim_menu(update.message)
+    await send_claim_menu(update.message, user.id)
 
 
 async def contact_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    save_user(update.effective_user)
-    await send_contact_menu(update.message)
+    if await is_blocked_by_maintenance(update):
+        return
+    user = update.effective_user
+    save_user(user)
+    await send_contact_menu(update.message, user.id)
+
+
+async def cancel_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    uid = user.id
+    save_user(user)
+
+    was_broadcasting = uid in awaiting_broadcast
+    if was_broadcasting:
+        awaiting_broadcast.remove(uid)
+
+    await delete_last_bot_message(ctx.bot, uid)
+
+    if was_broadcasting:
+        await update.message.reply_text(
+            "❌ Broadcast mode cancel kar diya gaya. Back to main menu:",
+            reply_markup=main_reply_keyboard(),
+        )
+        return
+
+    if await check_force_join(ctx.bot, uid):
+        await send_claim_menu(update.message, uid)
+    else:
+        await send_join_prompt(update.message, uid)
 
 
 async def broadcast_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -275,70 +350,84 @@ async def broadcast_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     awaiting_broadcast.add(uid)
     total_users = len(get_all_user_ids())
-    await update.message.reply_text(
+    await send_tracked_message(
+        update.message,
+        uid,
         f"📣 **Broadcast Mode ON** (Total Users: `{total_users}`)\n\n"
         "Ab jo bhi bhejoge—**Text, Photo, Video, ya Document/File**—"
         "woh sab users ko broadcast ho jayega.\n\n"
-        "Cancel karne ke liye `/cancel` bhejo.",
-        parse_mode="Markdown",
+        "Cancel & Back ke liye `/cancel` bhejo.",
     )
 
 
-async def cancel_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def maintenance_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    global maintenance_mode
     uid = update.effective_user.id
-    if uid in awaiting_broadcast:
-        awaiting_broadcast.remove(uid)
-        await update.message.reply_text("❌ Broadcast mode cancel kar diya gaya.")
-    else:
-        await update.message.reply_text("Koi active process nahi hai.")
+    if uid not in ADMIN_IDS:
+        await update.message.reply_text("⛔ Yeh command sirf Admin ke liye hai.")
+        return
+
+    maintenance_mode = not maintenance_mode
+    status_text = "ON 🔧" if maintenance_mode else "OFF ✅"
+    await update.message.reply_text(f"🛠️ **Maintenance Mode:** `{status_text}`")
 
 
 async def stats_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
         return
     total = len(get_all_user_ids())
-    await update.message.reply_text(f"📊 **Total Registered Users:** `{total}`", parse_mode="Markdown")
+    ping_status = "Configured ✅" if RENDER_EXTERNAL_URL else "Not Set ⚠️"
+    maint_status = "ON 🔧" if maintenance_mode else "OFF ✅"
+    await update.message.reply_text(
+        f"📊 **Bot Status & Stats**\n\n"
+        f"👥 Total Users: `{total}`\n"
+        f"⚡ Self-Ping URL: `{ping_status}`\n"
+        f"🛠️ Maintenance: `{maint_status}`"
+    )
 
 
 # ================= CALLBACKS =================
 async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if await is_blocked_by_maintenance(update):
+        return
     query = update.callback_query
     user = query.from_user
     save_user(user)
     data = query.data
 
     if data == "/claim":
-        joined = await check_force_join(ctx.bot, user.id)
-        if not joined:
+        if not await check_force_join(ctx.bot, user.id):
             await query.answer(
                 "❌ Abhi dono channels join nahi hue hain! Pehle dono join karo.",
                 show_alert=True,
             )
             return
         await query.answer("✅ Verification complete!")
-        await send_claim_menu(query.message)
+        await send_claim_menu(query.message, user.id)
 
     elif data == "/contact":
         await query.answer()
-        await send_contact_menu(query.message)
+        await send_contact_menu(query.message, user.id)
 
 
-# ================= REPLY BUTTONS, BROADCAST & USER TRACKING =================
+# ================= MESSAGE HANDLER =================
 async def handle_messages(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if await is_blocked_by_maintenance(update):
+        return
     msg = update.message
     if not msg:
         return
     user = update.effective_user
     save_user(user)
 
-    # 1. Agar admin broadcast mode mein hai
+    # 1. Admin Broadcast Mode
     if user.id in ADMIN_IDS and user.id in awaiting_broadcast:
         awaiting_broadcast.remove(user.id)
         user_ids = get_all_user_ids()
         sent = 0
         failed = 0
 
-        status_msg = await msg.reply_text(f"🚀 Broadcasting to `{len(user_ids)}` users...", parse_mode="Markdown")
+        status_msg = await msg.reply_text(f"🚀 Broadcasting to `{len(user_ids)}` users...")
 
         for target_id in user_ids:
             try:
@@ -355,53 +444,61 @@ async def handle_messages(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await status_msg.edit_text(
             f"✅ **Broadcast Complete!**\n\n"
             f"📤 Sent: `{sent}`\n"
-            f"⚠️ Failed/Blocked: `{failed}`",
-            parse_mode="Markdown",
+            f"⚠️ Failed/Blocked: `{failed}`"
         )
         return
 
-    # 2. Reply keyboard buttons handle karna
+    # 2. Reply Keyboard Buttons
     txt = (msg.text or "").strip()
     if txt == "Get otp panel":
-        joined = await check_force_join(ctx.bot, user.id)
-        if not joined:
-            await send_join_prompt(msg)
+        if not await check_force_join(ctx.bot, user.id):
+            await send_join_prompt(msg, user.id)
             return
-        await send_claim_menu(msg)
+        await send_claim_menu(msg, user.id)
     elif txt.lower() == "help":
-        await send_contact_menu(msg)
+        await send_contact_menu(msg, user.id)
     elif txt == "₹140 free⚡😘":
-        await send_free_140_loot(msg)
+        await send_free_140_loot(msg, user.id)
+    else:
+        await send_tracked_message(
+            msg,
+            user.id,
+            "👇 Kripya niche diye gaye buttons ka use karein:\n"
+            "• `Get otp panel`\n"
+            "• `help`\n"
+            "• `₹140 free⚡😘`\n\n"
+            "Pichhla step cancel karke back aane ke liye `/cancel` bhejein.",
+            reply_markup=main_reply_keyboard(),
+        )
+
+
+# ================= GLOBAL ERROR HANDLER =================
+async def error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE):
+    logger.error("Unhandled error: %s", ctx.error)
 
 
 # ================= MAIN =================
 def main():
     init_db()
-    
-    # 1. Thread 1: Start Web Server
     threading.Thread(target=start_web_server, daemon=True).start()
-
-    # 2. Thread 2: Start Anti-sleep Ping loop (Agar RENDER_URL maujood hai)
-    if RENDER_URL:
-        threading.Thread(target=keep_alive_ping_loop, daemon=True).start()
-    else:
-        print("⚠️ Warning: Please set 'RENDER_EXTERNAL_URL' in Render Environment Variables for Anti-sleep feature to work!")
+    threading.Thread(target=keep_alive_loop, daemon=True).start()
 
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("claim", claim_cmd))
     app.add_handler(CommandHandler("contact", contact_cmd))
-    app.add_handler(CommandHandler("broadcast", broadcast_cmd))
     app.add_handler(CommandHandler("cancel", cancel_cmd))
+    app.add_handler(CommandHandler("broadcast", broadcast_cmd))
+    app.add_handler(CommandHandler("maintenance", maintenance_cmd))
     app.add_handler(CommandHandler("stats", stats_cmd))
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_messages))
+    app.add_error_handler(error_handler)
 
-    print("Bot is up and polling...")
+    logger.info("Bot start ho raha hai...")
     app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
     main()
-    
