@@ -2,6 +2,8 @@ import asyncio
 import os
 import sqlite3
 import threading
+import time
+import requests
 from flask import Flask
 from telegram import (
     InlineKeyboardButton,
@@ -22,12 +24,15 @@ from telegram.ext import (
 # ================= CONFIG =================
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "9079313944:AAFXcg-quWi7ABouEQX8724Hiscr_wHLR9U")
 
+# APNA RENDER WEB SERVICE URL YAHAN DAALEIN (e.g., https://your-app.onrender.com)
+# Is URL par har 12 minute mein automatic pin jayega taaki sleep na ho.
+RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", "") 
+
 FORCE_CHANNELS = [
     {"id": -1004383355739, "name": "📢 JOIN CHANNEL 1", "url": "https://t.me/+ILptMG11g3c0ZDg1"},
     {"id": -1004474453856, "name": "📢 JOIN CHANNEL 2", "url": "https://t.me/+UyBmDcQRKORlNGI1"},
 ]
 
-# ₹140 free⚡😘 button ke liye channel link (zaroorat ho toh apna link yahan badal le)
 FREE_140_CHANNEL_URL = os.environ.get("FREE_140_CHANNEL_URL", "https://t.me/+ILptMG11g3c0ZDg1")
 
 ADMIN_IDS = {8429424734, 8472943262}
@@ -35,7 +40,6 @@ DB_PATH = "bot_data.db"
 PORT = int(os.environ.get("PORT", "8080"))
 
 awaiting_broadcast = set()
-
 
 # ================= DATABASE =================
 def get_db():
@@ -93,6 +97,36 @@ def health():
 
 def start_web_server():
     web_app.run(host="0.0.0.0", port=PORT, use_reloader=False)
+
+
+# ================= ANTI-SLEEP SELF PINGER ⚡ =================
+def keep_alive_ping_loop():
+    """Ye loop background mein har 12 minute mein Render URL ko request bhejta hai taaki server online rahe."""
+    # Deploy hone ke baad 60s wait karega start hone ke liye
+    time.sleep(60) 
+    url_to_ping = RENDER_URL.strip()
+    
+    if not url_to_ping:
+        print("⚠️ Warn: RENDER_EXTERNAL_URL configure nahi hai! Self-ping chalu nahi ho paya.")
+        return
+        
+    if not url_to_ping.endswith("/health"):
+        url_to_ping = url_to_ping.rstrip("/") + "/health"
+
+    print(f"🚀 Anti-Sleep loop start ho chuka hai! Target URL: {url_to_ping}")
+    while True:
+        try:
+            # Server ko jagaye rakhne ke liye self GET request
+            response = requests.get(url_to_ping, timeout=15)
+            if response.status_code == 200:
+                print(f"⚡ Ping Successful! Bot is Awake ({response.status_code})")
+            else:
+                print(f"⚠️ Ping status suspicious: {response.status_code}")
+        except Exception as e:
+            print(f"❌ Ping request failed: {e}. (Re-trying in next 12m)")
+        
+        # Har 12 minute (720 seconds) mein ping bhejega (Render sleep time is 15 mins)
+        time.sleep(720)
 
 
 # ================= KEYBOARDS & MENUS =================
@@ -343,7 +377,15 @@ async def handle_messages(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ================= MAIN =================
 def main():
     init_db()
+    
+    # 1. Thread 1: Start Web Server
     threading.Thread(target=start_web_server, daemon=True).start()
+
+    # 2. Thread 2: Start Anti-sleep Ping loop (Agar RENDER_URL maujood hai)
+    if RENDER_URL:
+        threading.Thread(target=keep_alive_ping_loop, daemon=True).start()
+    else:
+        print("⚠️ Warning: Please set 'RENDER_EXTERNAL_URL' in Render Environment Variables for Anti-sleep feature to work!")
 
     app = Application.builder().token(BOT_TOKEN).build()
 
@@ -356,10 +398,10 @@ def main():
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_messages))
 
-    print("Bot chal raha hai...")
+    print("Bot is up and polling...")
     app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
     main()
-        
+    
