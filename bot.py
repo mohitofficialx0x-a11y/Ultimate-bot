@@ -2,10 +2,6 @@ import asyncio
 import logging
 import os
 import sqlite3
-import threading
-import time
-from flask import Flask
-import requests
 from telegram import (
     InlineKeyboardMarkup,
     ReplyKeyboardMarkup,
@@ -29,8 +25,7 @@ logging.basicConfig(
 logger = logging.getLogger("MohitBot")
 
 # ================= CONFIG =================
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "9079313944:AAFXcg-quWi7ABouEQX8724Hiscr_wHLR9U")
-RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "").strip()
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "9108762644:AAHuef8uOZ0dBG0iU4cmDaU0BAlpO-gydDc")
 
 FORCE_CHANNELS = [
     {"id": -1004383355739, "name": "📢 JOIN CHANNEL 1", "url": "https://t.me/+ILptMG11g3c0ZDg1"},
@@ -40,7 +35,6 @@ FORCE_CHANNELS = [
 FREE_140_CHANNEL_URL = os.environ.get("FREE_140_CHANNEL_URL", "https://t.me/+ILptMG11g3c0ZDg1")
 ADMIN_IDS = {8429424734, 8472943262}
 DB_PATH = "bot_data.db"
-PORT = int(os.environ.get("PORT", "8080"))
 
 awaiting_broadcast = set()
 maintenance_mode = False
@@ -87,47 +81,6 @@ def get_all_user_ids():
     with get_db() as con:
         rows = con.execute("SELECT user_id FROM users").fetchall()
     return [r["user_id"] for r in rows]
-
-
-# ================= WEB SERVER & IN-CODE PING =================
-web_app = Flask(__name__)
-
-
-@web_app.get("/")
-def home():
-    return "Bot is alive!", 200
-
-
-@web_app.get("/health")
-def health():
-    return "OK", 200
-
-
-def start_web_server():
-    web_app.run(host="0.0.0.0", port=PORT, use_reloader=False)
-
-
-def get_ping_targets():
-    targets = []
-    if RENDER_EXTERNAL_URL:
-        targets.append(f"{RENDER_EXTERNAL_URL.rstrip('/')}/health")
-    targets.append(f"http://127.0.0.1:{PORT}/health")
-    return targets
-
-
-def code_ping_loop():
-    time.sleep(20)
-    targets = get_ping_targets()
-    logger.info("Code ping loop started. Targets: %s", targets)
-
-    while True:
-        for url in targets:
-            try:
-                res = requests.get(url, timeout=10)
-                logger.info("Ping %s -> %s", url, res.status_code)
-            except Exception as exc:
-                logger.warning("Ping failed for %s: %s", url, exc)
-        time.sleep(300)  # Har 5 minute mein ping
 
 
 # ================= KEYBOARDS =================
@@ -359,9 +312,8 @@ async def stats_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
         return
     total = len(get_all_user_ids())
-    ping_ok = "Set ✅" if RENDER_EXTERNAL_URL else "Local Only ⚠️"
     await update.message.reply_text(
-        f"📊 **Stats**\nUsers: `{total}`\nPing Mode: `{ping_ok}`"
+        f"📊 **Stats**\nUsers: `{total}`"
     )
 
 
@@ -439,13 +391,22 @@ async def error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE):
     logger.error("Error: %s", ctx.error)
 
 
+# ================= MENU COMMANDS =================
+async def post_init(application: Application):
+    await application.bot.set_my_commands(
+        [
+            ("start", "🚀 Start the Bot"),
+            ("help", "💬 Help & Support"),
+            ("cancel", "↩️ Cancel & Go Back"),
+            ("broadcast", "📣 Broadcast (Owner Only ⚡🖥️)"),
+        ]
+    )
+
+
 # ================= MAIN =================
 def main():
     init_db()
-    threading.Thread(target=start_web_server, daemon=True).start()
-    threading.Thread(target=code_ping_loop, daemon=True).start()
-
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("claim", claim_cmd))
     app.add_handler(CommandHandler("contact", contact_cmd))
@@ -463,4 +424,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-            
+    
